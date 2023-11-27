@@ -1,0 +1,5 @@
+azure-identity
+azure-keyvault-secrets
+docker
+fabric==3.2.2
+pre-commit
