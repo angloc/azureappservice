@@ -8,18 +8,22 @@
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	"features": {
 		"ghcr.io/devcontainers/features/azure-cli:1": {},
-		"ghcr.io/devcontainers/features/desktop-lite:1": {},
+		"ghcr.io/devcontainers/features/desktop-lite:1": {
+			"password": "vscode",
+			"webPort": "6080",
+			"vncPort": "5901"
+		},
 		"ghcr.io/devcontainers/features/docker-in-docker:2": {},
 		"ghcr.io/devcontainers/features/kubectl-helm-minikube:1": {},
 		"ghcr.io/devcontainers-contrib/features/curl-apt-get:1": {},
-		"ghcr.io/devcontainers-contrib/features/terraform-asdf:2": {},
+		"ghcr.io/devcontainers-contrib/features/pulumi:1": {},
 		"ghcr.io/devcontainers-contrib/features/wget-apt-get:1": {},
-		"ghcr.io/eitsupi/devcontainer-features/jq-likes:1": {},
+		"ghcr.io/eitsupi/devcontainer-features/jq-likes:2.1.0": {},
 		"ghcr.io/stuartleeks/dev-container-features/azure-cli-persistence:0": {}
 	},
 
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
-	// "forwardPorts": [6080, 8000],
+	// "forwardPorts": [6080, 5901, 8000],
 
 	// Use 'postCreateCommand' to run commands after the container is created.
 	"postCreateCommand": "bash .devcontainer/postCreateCommand.sh"
