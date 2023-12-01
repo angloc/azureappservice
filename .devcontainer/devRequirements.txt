@@ -1,5 +1,10 @@
 azure-identity
 azure-keyvault-secrets
+azure-mgmt-resource
+azure-graphrbac
 docker
 fabric==3.2.2
+openpyxl
 pre-commit
+pulumi
+pulumi_azure
