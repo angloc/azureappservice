@@ -1,16 +1,45 @@
+import enum
+import os
+import subprocess
+import tempfile
+
 from azure.identity import DefaultAzureCredential
 from azure.graphrbac import GraphRbacManagementClient
 from azure.mgmt.resource import SubscriptionClient
-#from azure.mgmt.keyvault import KeyVaultManagementClient
-#from azure.mgmt.keyvault.models import AccessPolicyEntry, Permissions
-#from azure.mgmt.storage import StorageManagementClient
-#from azure.mgmt.storage.models import StorageAccountCreateParameters, StorageAccountUpdateParameters
-from azure.core.exceptions import ClientAuthenticationError
+from azure.mgmt.keyvault import KeyVaultManagementClient
+from azure.mgmt.keyvault.models import AccessPolicyEntry, Permissions
+from azure.mgmt.resource import ResourceManagementClient
+from azure.mgmt.storage import StorageManagementClient
+from azure.mgmt.storage.models import StorageAccountCreateParameters, StorageAccountUpdateParameters
+from azure.storage.blob import BlobServiceClient
+from azure.core.exceptions import ClientAuthenticationError, ResourceExistsError
 
 import pulumi
 import pulumi_azure as azure
 
 import openpyxl
+
+class ResourceTypes(enum.Enum):
+    APP_SERVICE_PLAN = "app_service_plan"
+    STORAGE_ACCOUNT = "storage_account"
+    FILE_SHARE = "file_share"
+    APP_INSIGHTS = "app_insights"
+    KEY_VAULT = "key_vault"
+    APP_SERVICE = "app_service"
+    RESOURCE_GROUP = "resource_group"
+    DATABASE_SERVER = "database_server"
+    MANAGED_IDENTITY = "managed_identity"
+
+defaultTemplates = {
+    ResourceTypes.APP_SERVICE_PLAN: "asp-{service}-{location}",
+    ResourceTypes.APP_SERVICE: "{service}{location}{app}",
+    ResourceTypes.APP_INSIGHTS: "{service}{location}",
+    ResourceTypes.FILE_SHARE: "files",
+    ResourceTypes.KEY_VAULT: "kv-{service}-{location}",
+    ResourceTypes.STORAGE_ACCOUNT: "st{service}{location}",
+    ResourceTypes.DATABASE_SERVER: "dbs{service}{location}",
+    ResourceTypes.MANAGED_IDENTITY: "mi{service}{location}",
+}
 
 # Function to convert rows to dictionaries based on the header row
 def rows_to_dicts(sheet):
@@ -28,7 +57,7 @@ def worksheet_to_dict(worksheet):
             data_dict[key] = value
     return data_dict
 
-def validate_azure (tenant_name, subscription_name):
+def validate_azure (subscription_name):
     # Authenticate with Azure
 
     credential = DefaultAzureCredential()
@@ -41,41 +70,16 @@ def validate_azure (tenant_name, subscription_name):
         for subscription in subscription_details:
             name = subscription.display_name
             tenant_id = subscription.tenant_id
-            print(f"Subscription {name} belongs to {known_tenants_by_id [tenant.id].display_name}")
             known_subscriptions [name] = subscription
     except ClientAuthenticationError:
         raise ValueError("Authentication failed - ensure you are logged in to Azure CLI")
 
     if subscription_name not in known_subscriptions:
         raise ValueError(f"Subscription {subscription_name} not found in your credentials")
+    subscription = known_subscriptions [subscription_name]
+    print (f"Using Azure subscription '{subscription_name}' ({subscription.subscription_id})")
 
-    # Initialize the GraphRbacManagementClient
-    graph_client = GraphRbacManagementClient(credential, tenant_id)
-
-    # Get the tenant details
-    known_tenants_by_name = {}
-    known_tenants_by_id = {}
-
-    tenant_details = graph_client.tenants.list()
-    for tenant in tenant_details:
-        print(f"Tenant ID: {tenant.tenant_id}")
-        print(f"Tenant Name: {tenant.display_name}")
-        known_tenants_by_name [tenant.display_name] = tenant
-        known_tenants_by_id [tenant.id] = tenant
-
-    # Validate tenant
-    if tenant_name not in known_tenants_by_name:
-        raise ValueError(f"Tenant {tenant} not found")
-    else:
-        tenant_id = known_tenants_by_name[tenant].tenant_id
-
-    # Validate subscription
-    if subscription not in known_subscriptions:
-        raise ValueError(f"Subscription {subscription} not found")
-    else:
-        subscription_id = known_subscriptions[subscription].subscription_id
-
-    return tenant, subscription
+    return subscription
 
 def validate_resources(config_file):
     # Load the workbook
@@ -83,63 +87,163 @@ def validate_resources(config_file):
     # Read Pulumi worksheet
     pulumi_sheet = workbook['Configuration']
     config = worksheet_to_dict(pulumi_sheet)
-    if 'Tenant' not in config:
-        raise ValueError("Tenant not found in Config worksheet")
-    tenant_name = config['Tenant']
+    templates = {}
+    templates.update(defaultTemplates)
+    if 'Templates' in workbook:
+        templates_sheet = workbook['Templates']
+        templates.update (rows_to_dicts(templates_sheet))
+    workbook.close()
+    print (templates)
     if 'Subscription' not in config:
-        raise ValueError("Subscription not found in Config worksheet")
+        raise ValueError("Subscription not found in Configuration worksheet")
     subscription_name = config['Subscription']
     if 'Pulumi Resource Group' not in config:
-        raise ValueError("'Pulumi Resource Group' not found in Config worksheet")
+        raise ValueError("'Pulumi Resource Group' not found in Configuration worksheet")
     pulumi_resource_group = config['Pulumi Resource Group']
+    if 'Pulumi Storage Account' not in config:
+        raise ValueError("'Pulumi Storage Account' not found in Configuration worksheet")
     pulumi_storage_account = config.get("Pulumi Storage Account", "pulumi")
     pulumi_container = config.get("Pulumi Container", "pulumi")
-    tenant, subscription = validate_azure(tenant_name, subscription_name)
-    return tenant, subscription, pulumi_resource_group, pulumi_storage_account, pulumi_container
+    pulumi_location = config.get("Pulumi Location", "uksouth")
+    subscription = validate_azure(subscription_name)
 
-def deploy_resources():
+    return templates, subscription, pulumi_resource_group, pulumi_storage_account, pulumi_location, pulumi_container
 
-    config = pulumi.Config()
-    config_file = config.require('config-file', )
+def ensure_pulumi_resources(subscription_id, resource_group_name, storage_account_name, location, container_name, stack_name):
 
-    # Authenticate with Azure
+    def send_script_to_pulumi(script):
+        # print ("Sending to Pulumi", script)
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write(script)
+            f.flush()
+            subprocess.run(["bash", f.name], check=True)
+            os.remove (f.name)
 
+    # Create a credential object using DefaultAzureCredential
     credential = DefaultAzureCredential()
-    subscription_client = SubscriptionClient(credential)
 
+    # Create a client object for Resource Management
+    resource_client = ResourceManagementClient(credential, subscription_id)
 
-    # Initialize the GraphRbacManagementClient
-    graph_client = GraphRbacManagementClient(credential, tenant_id)
+    # Create a client object for Storage Management
+    storage_client = StorageManagementClient(credential, subscription_id)
 
-    # Get the tenant details
-    known_tenants_by_name = {}
-    known_tenants_by_id = {}
-    tenant_details = graph_client.tenants.list()
-    for tenant in tenant_details:
-        print(f"Tenant ID: {tenant.tenant_id}")
-        print(f"Tenant Name: {tenant.display_name}")
-        known_tenants_by_name [tenant.display_name] = tenant
-        known_tenants_by_id [tenant.id] = tenant
+    # Check if the resource group exists, and create if not
+    resource_group = resource_client.resource_groups.check_existence(resource_group_name)
+    if not resource_group:
+        print(f"Creating resource group '{resource_group_name}'at location '{location}'")
+        resource_client.resource_groups.create_or_update(resource_group_name, {'location': location})
 
-    # Get subscription details
-    subscription_details = subscription_client.subscriptions.list()
-    known_subscriptions = {}
-    for subscription in subscription_details:
-        subscription_name = subscription.display_name
-        tenant_id = subscription.tenant_id
-        print(f"Subscription {subscription_name} belongs to {known_tenants_by_id [tenant.id].display_name}")
-        known_subscriptions [subscription_name] = subscription
+    # Check if the storage account exists, and create if not
+    storage_accounts = storage_client.storage_accounts.list_by_resource_group(resource_group_name)
+    storage_account_exists = any(account.name == storage_account_name for account in storage_accounts)
 
-    # Load the workbook
-    workbook = openpyxl.load_workbook(config_file)
+    if not storage_account_exists:
+        print(f"Creating storage account '{storage_account_name}'...")
+        try:
+            storage_client.storage_accounts.begin_create(resource_group_name, storage_account_name, {
+                'location': location,
+                'sku': {'name': 'Standard_LRS'},
+                'kind': 'StorageV2'
+            }).result()
+        except ResourceExistsError as e:
+            print(f"Storage account '{storage_account_name}' already exists elsewhere")
 
+    # Get the storage account key
+    storage_keys = storage_client.storage_accounts.list_keys(resource_group_name, storage_account_name)
+    storage_key = storage_keys.keys[0].value
+    storage_url = f"https://{storage_account_name}.blob.core.windows.net"
+
+    # Create a BlobServiceClient to manage containers
+    blob_service_client = BlobServiceClient(account_url=storage_url, credential=storage_key)
+
+    # Check if the container exists, and create if not
+    container_client = blob_service_client.get_container_client(container_name)
+    if not container_client.exists():
+        print(f"Creating Pulumi container '{container_name}'...")
+        blob_service_client.create_container(container_name)
+
+    # Pulumi stack file name
+    stack_file_name = f".pulumi/stacks/devops/{stack_name}.json"
+
+    PULUMI_INITIALISATION_SCRIPT = f"""
+    #!/bin/bash
+    set -e
+    export AZURE_STORAGE_ACCOUNT={storage_account_name}
+    export AZURE_STORAGE_KEY={storage_key}
+    export CONFIG_FILE=f"{stack_name}.xlsx"
+    export PULUMI_CONFIG_PASSPHRASE="No secrets here"
+    pulumi login --cloud-url azblob://{container_name}
+    """
+
+    # Check if Pulumi project has been set up
+    blob_list = list(container_client.list_blobs())
+    for blob in blob_list: print (blob.name)
+    project_exists = any(blob.name.startswith('.pulumi') for blob in blob_list)
+    if not project_exists:
+        print(f"Creating Pulumi project")
+        send_script_to_pulumi(
+            PULUMI_INITIALISATION_SCRIPT + "\n" + 
+            "pulumi new azure-python --name devops --yes"
+        )
+
+    # Check if Pulumi stack for this spreadsheet has been set up
+    stack_exists = any(blob.name == stack_file_name for blob in blob_list)
+    if not stack_exists:       
+        # Run Pulumi new command in a subprocess
+        print(f"Creating Pulumi stack {stack_name}")
+        send_script_to_pulumi(PULUMI_INITIALISATION_SCRIPT + "\n" + f"pulumi stack init {stack_name}")
+
+    print(f"All Azure resources for Pulumi stack '{stack_name}' are set up in storage account '{storage_account_name}'")
+    return storage_url, storage_key
+
+def upload_file_to_blob(account_url, account_key, container_name, file_path):
+    try:
+        # Create a BlobServiceClient using the storage account name and account key
+        blob_service_client = BlobServiceClient(account_url, credential=account_key)
+        
+        # Get a reference to the container
+        container_client = blob_service_client.get_container_client(container_name)
+
+        # Get the file name from the file path
+        local_file_name = os.path.basename(file_path)
+
+        # Create a blob client using the local file name as the name for the blob
+        blob_client = container_client.get_blob_client(blob=local_file_name)
+
+        # Upload the local file to the blob
+        with open(file_path, "rb") as data:
+            blob_client.upload_blob(data, overwrite=True)
+
+        print(f"..File {local_file_name} uploaded to blob container {container_name}")
+
+    except Exception as e:
+        print(f'--Failed to upload {file_path} to Pulumi container: {e}')
+
+def deploy_resources(config_file=None):
+        
+    if not config_file:
+        # Running in Pulumi
+        print ("..Running Pulumi to update stack")
+        config = pulumi.Config()
+        config_file = config.require('config-file')
+
+    templates, subscription, subscription_slug, pulumi_resource_group, \
+            pulumi_storage_account, pulumi_location, pulumi_container =\
+            validate_resources(config_file)
+    ensure_pulumi_resources(subscription.subscription_id,
+        pulumi_resource_group, pulumi_storage_account, pulumi_location, pulumi_container)
 
     return
 
     # Read deployments worksheet
+    workbook = openpyxl.load_workbook(config_file)
 
     deployments_sheet = workbook['Deployments']
     deployments = rows_to_dicts(deployments_sheet)
+    workbook.close()
+
+    # Advise Pulumi of the current configuration
 
     for deployment in deployments:
         resource_group_name = deployment['Resource Group']
@@ -218,6 +322,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # When called outside Pulumi
-    validate_resources(args.configFile)
+    templates, subscription, pulumi_resource_group, pulumi_storage_account, pulumi_location, pulumi_container =\
+        validate_resources(args.configFile)
+    stack_name = os.path.splitext(os.path.basename(args.configFile))[0]
+    print (stack_name)
+    storage_url, storage_key = ensure_pulumi_resources(subscription.subscription_id,
+        pulumi_resource_group, pulumi_storage_account, pulumi_location, pulumi_container, stack_name)
+    upload_file_to_blob(storage_url, storage_key, pulumi_container, args.configFile)
 else:
     deploy_resources()

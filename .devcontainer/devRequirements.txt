@@ -1,7 +1,10 @@
 azure-identity
 azure-keyvault-secrets
+azure-mgmt-keyvault
 azure-mgmt-resource
+azure-mgmt-storage
 azure-graphrbac
+azure-storage-blob
 docker
 fabric==3.2.2
 openpyxl
