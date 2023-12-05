@@ -5,17 +5,12 @@ import tempfile
 import sys
 
 from azure.identity import DefaultAzureCredential
-from azure.graphrbac import GraphRbacManagementClient
 from azure.mgmt.resource import SubscriptionClient
-from azure.mgmt.keyvault import KeyVaultManagementClient
-from azure.mgmt.keyvault.models import AccessPolicyEntry, Permissions
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.storage import StorageManagementClient
-from azure.mgmt.storage.models import StorageAccountCreateParameters, StorageAccountUpdateParameters
 from azure.storage.blob import BlobServiceClient
 from azure.core.exceptions import ClientAuthenticationError, ResourceExistsError
 
-import pulumi
 import pulumi_azure
 from pulumi.automation import LocalWorkspace, LocalWorkspaceOptions, Stack, ProjectSettings, select_stack
 
@@ -28,10 +23,10 @@ class ResourceTypes(enum.Enum):
     APP_INSIGHTS = "app_insights"
     KEY_VAULT = "key_vault"
     APP_SERVICE = "app_service"
-    RESOURCE_GROUP = "resource_group"
     DATABASE_SERVER = "database_server"
     MANAGED_IDENTITY = "managed_identity"
     DATABASE = "database"
+    KEY_VAULT_ACCESS_POLICY = "key_vault_access_policy"
 
 defaultTemplates = {
     ResourceTypes.APP_SERVICE_PLAN: "{Service}",
@@ -43,6 +38,7 @@ defaultTemplates = {
     ResourceTypes.DATABASE_SERVER: "{Subscription}-{Service}",
     ResourceTypes.DATABASE: "{App}",
     ResourceTypes.MANAGED_IDENTITY: "{Subscription}{Service}",
+    ResourceTypes.KEY_VAULT_ACCESS_POLICY: "{Subscription}-{Service}-{App}"
 }
 
 # Function to convert rows to dictionaries based on the header row
@@ -119,7 +115,7 @@ def validate_resources(config_file):
 
 def send_script_to_pulumi(script, initialiser=""):
     if initialiser: script = initialiser + "\n" + script
-    #print ("Sending to Pulumi", script)
+    print ("Sending to Pulumi", script)
     with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
         f.write(script)
         f.flush()
@@ -183,6 +179,7 @@ def ensure_pulumi_resources(subscription_id, resource_group_name, storage_accoun
         export CONFIG_FILE=f"{stack_name}.xlsx"
         export PULUMI_CONFIG_PASSPHRASE="No secrets here"
         pulumi login --cloud-url azblob://{container_name}
+        pulumi stack ls
     """
 
     # Check if Pulumi project has been set up
@@ -270,6 +267,7 @@ def deploy_resources(config_file):
         validate_deployments_column('sku', i, "B1")
         validate_deployments_column('Region', i, "uksouth")
         validate_deployments_column('Files quota', i, "50")
+        validate_deployments_column('Stopped', i, "1")
         deployment['Subscription'] = subscription_slug.lower ()
 
         # Check if the resource group exists
@@ -281,14 +279,17 @@ def deploy_resources(config_file):
             raise ValueError(f"Resource group '{resource_group_name}' does not exist in subscription '{subscription.name}'")
         resource_groups [resource_group_name] = resource_group
 
+    service_configurations = {}
+
     for i, deployment in enumerate (deployments):
 
         resource_group_name = deployment['Resource Group']
         resource_group = resource_groups [resource_group_name]
-        service = deployment['Service'] = deployment['Service'].lower()        
+        service_name = deployment['Service'] = deployment['Service'].lower()        
         location = deployment['Region'] = deployment['Region'].lower()
         app_name = deployment.get ("App")
-        quota = deployment.get ("Files quota")
+        quota_str = deployment.get ("Files quota")
+        quota = int(quota_str) if quota_str else 0
         sku = deployment['sku']
 
         defines = deployment['Defines'].lower()
@@ -296,6 +297,9 @@ def deploy_resources(config_file):
 
         # Create an App Service Plan
         if defines == "service":
+
+            if service_name in service_configurations:
+                raise ValueError(f"Row {i+1}: Service '{service_name}' has already been created by row {service_configurations [service_name]['index']+1} of the deployments worksheet")
 
             app_service_plan_name = templates [ResourceTypes.APP_SERVICE_PLAN].format (**deployment)
             app_service_plan = pulumi_azure.appservice.ServicePlan(
@@ -315,13 +319,14 @@ def deploy_resources(config_file):
                 account_tier="Standard"
             )
 
-            # Create an Azure File Share
-            file_share_name = templates [ResourceTypes.FILE_SHARE].format (**deployment)
-            file_share = pulumi_azure.storage.Share(
-                file_share_name, name=file_share_name,
-                storage_account_name=storage_account.name,
-                quota=int(quota)
-            )
+            if quota:
+                # Create an Azure File Share
+                file_share_name = templates [ResourceTypes.FILE_SHARE].format (**deployment)
+                file_share = pulumi_azure.storage.Share(
+                    file_share_name, name=file_share_name,
+                    storage_account_name=storage_account.name,
+                    quota=int(quota)
+                )
 
             # Create an Application Insights instance
             app_insights_name = templates [ResourceTypes.APP_INSIGHTS].format (**deployment)
@@ -339,11 +344,44 @@ def deploy_resources(config_file):
                 sku_name="standard",
                 tenant_id=subscription.tenant_id,
             )
+
+            # Store the storage account key in the Key Vault
+            _ = pulumi_azure.keyvault.Secret("azureStorageAccountKey",
+                         key_vault_id=key_vault.id,
+                         value=storage_account.primary_access_key,
+                         name="azureStorageAccountKey"
+            )
+            _ = pulumi_azure.keyvault.Secret("azureStorageAccountName",
+                         key_vault_id=key_vault.id,
+                         value=storage_account_name,
+                         name="azureStorageAccountName"
+            )
+
+            service_configurations [service_name] = {
+                "index": i,
+                "resource_group": resource_group,
+                "app_service_plan": app_service_plan,
+                "storage_account": storage_account,
+                "file_share": file_share,
+                "app_insights": app_insights,
+                "key_vault": key_vault,
+                "apps": {}
+            }
         
         if defines == "app":
 
+            if not service_name in service_configurations:
+                raise ValueError(f"Row {i+1}: Service '{service_name}' has not been created by a previous row of the deployments worksheet")
+
+            if app_name in service_configurations [service_name]['apps']:
+                raise ValueError(f"Row {i+1}: App '{app_name}' has already been created by row {service_configurations [service_name]['apps'][app_name]['index']+1} of the deployments worksheet")
+
+            service = service_configurations [service_name]
+            app_service_plan = service ["app_service_plan"]
+            resource_group = service ["resource_group"]
+            app_insights = service ["app_insights"]
+
             # Create an App Service with a system-assigned managed identity
-            identity=pulumi_azure.appservice.AppServiceIdentityArgs(type="SystemAssigned")
             app_service = pulumi_azure.appservice.AppService(
                 app_name,
                 resource_group_name=resource_group.name,
@@ -352,26 +390,31 @@ def deploy_resources(config_file):
                     "WEBSITE_STOPPED": "1" if deployment['Status'] == 'stopped' else "0",
                     "APPINSIGHTS_INSTRUMENTATIONKEY": app_insights.instrumentation_key
                 },
-                identity=identity
+                identity=azure.appservice.AppServiceIdentityArgs(type='SystemAssigned') 
             )
 
             # Assign access policy to the Key Vault for the managed identity
-            key_vault.AccessPolicy(
-                f"{app_name}-access",
+            access_policy_name = templates [ResourceTypes.KEY_VAULT_ACCESS_POLICY].format (**deployment)
+            access_policy = pulumi_azure.keyvault.AccessPolicy(access_policy_name,
                 key_vault_id=key_vault.id,
                 tenant_id=subscription.tenant_id,
-                object_id=app_service.identity.apply(lambda id: id.principal_id),
-                key_permissions=["get"],
-                secret_permissions=["get"]
-            )
+                object_id=app_service.identity.apply(lambda identity: identity.principal_id if identity else None),
+                key_permissions=[
+                    "Get",
+                    "List"
+                ])
 
 if __name__ == "__main__":
     import argparse
     import json
+    import traceback as tb
 
     parser = argparse.ArgumentParser(description="Deploy Azure resources based on an Excel configuration")
     parser.add_argument("configFile", help="Path to the Excel configuration file")
     parser.add_argument('--pulumi', type=str, help='Pulumi command to run.')
+    parser.add_argument('--execute', action='store_true', default=False, help='Execute pulumi up')
+    parser.add_argument('--no-execute', action='store_true', default=False, help='Execute pulumi preview')
+
     args = parser.parse_args()
 
     templates, subscription, subscription_slug, pulumi_resource_group, pulumi_storage_account, pulumi_location, pulumi_container =\
@@ -383,25 +426,39 @@ if __name__ == "__main__":
     if args.pulumi:
         send_script_to_pulumi(f"pulumi stack select {stack_name}\npulumi {args.pulumi}", initialiser)
     else:
-        os.environ ["AZURE_STORAGE_ACCOUNT"] = pulumi_storage_account
-        os.environ ["AZURE_STORAGE_KEY"] = storage_key
-        os.environ ["PULUMI_CONFIG_PASSPHRASE"] ="No secrets here"
-        project_settings=ProjectSettings(
-            name="devops",
-            runtime="python",
-            backend={"url": f"azblob://{pulumi_container}"}
-        )
-        workspace = LocalWorkspace(project_settings=project_settings)
-        selected_stack = select_stack(
-            stack_name=stack_name,
-            program=lambda: deploy_resources (args.configFile),
-            project_name="devops",
-            opts=LocalWorkspaceOptions(project_settings=project_settings)
-        )
+        try:
+            os.environ ["AZURE_STORAGE_ACCOUNT"] = pulumi_storage_account
+            os.environ ["AZURE_STORAGE_KEY"] = storage_key
+            os.environ ["PULUMI_CONFIG_PASSPHRASE"] ="No secrets here"
+            project_settings=ProjectSettings(
+                name="devops",
+                runtime="python",
+                backend={"url": f"azblob://{pulumi_container}"}
+            )
+            workspace = LocalWorkspace(project_settings=project_settings)
+            selected_stack = select_stack(
+                stack_name=stack_name,
+                program=lambda: deploy_resources (args.configFile),
+                project_name="devops",
+                opts=LocalWorkspaceOptions(project_settings=project_settings)
+            )
+            if args.execute:
+                up_result = selected_stack.up()
+                upload_file_to_blob(storage_url, storage_key, pulumi_container, args.configFile)
+                print(f"update summary: \n{json.dumps(up_result.summary.resource_changes, indent=4)}")
+            else:
+                up_result = selected_stack.preview()
+                if up_result.stdout:
+                    print (up_result.stdout)
+                if up_result.stderr:
+                    print ("Errors", up_result.stderr) 
 
-        up_result = selected_stack.up()
-        print(f"update summary: \n{json.dumps(up_result.summary.resource_changes, indent=4)}")
-
-        upload_file_to_blob(storage_url, storage_key, pulumi_container, args.configFile)
+        except Exception as e:
+            if isinstance(e, ValueError):
+                print (f"Error: {e}")
+            else:
+                print (f"Unexpected error: {e}")
+                tb.print_exc()
+        sys.exit(0)
 
 
